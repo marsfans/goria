@@ -1,0 +1,14 @@
+# goria 配置文件: 放在 ./goria.yaml 或 ~/.config/goria/goria.yaml, 或用 --conf 指定
+# 优先级: 命令行参数 > 环境变量 GORIA_* > 配置文件 > 默认值
+dir: ./downloads
+split: 16                      # 每个任务连接数
+max-concurrent-downloads: 3    # 同时任务数
+max-speed: 0                   # 全局限速, 如 5M
+max-tries: 5
+min-split-size: 1M
+user-agent: goria/1.0
+# all-proxy: socks5://127.0.0.1:1080
+# header:
+#   - "Referer: https://example.com"
+seed-ratio: 0                  # BT 做种分享率
+listen-port: 0
