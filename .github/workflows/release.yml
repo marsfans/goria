@@ -1,0 +1,84 @@
+name: Release goria
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（同时作为 tag 和 Release 名称），如 v1.1.0"
+        required: true
+      notes:
+        description: "更新内容（留空则自动使用上个版本以来的提交说明）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ inputs.version }}
+        run: |
+          ext=""; [ "$GOOS" = windows ] && ext=".exe"
+          out="goria-${VERSION}-${GOOS}-${GOARCH}${ext}"
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "$out" .
+          echo "OUT=$out" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUT }}
+          path: ${{ env.OUT }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 拉取完整历史和 tag，用于生成提交说明
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums & notes
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          cd dist && sha256sum * > SHA256SUMS && cd ..
+          if [ -n "$NOTES" ]; then
+            printf '%b\n' "$NOTES" > notes.md
+          else
+            # 上一个 tag 到当前提交之间的提交说明（标题行），去掉合并提交
+            prev=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)  # HEAD^ 跳过当前提交上已打的 tag
+            range=${prev:+$prev..HEAD}
+            git log $range --no-merges --pretty='- %s' > notes.md
+            [ -s notes.md ] || git log -1 --pretty='- %s' > notes.md
+          fi
+          cat notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body_path: notes.md
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/*
+            goria.example.yaml
