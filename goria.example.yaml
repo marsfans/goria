@@ -12,3 +12,4 @@ user-agent: goria/1.0
 #   - "Referer: https://example.com"
 seed-ratio: 0                  # BT 做种分享率
 listen-port: 0
+# save-session: ~/.config/goria/session.json   # 会话文件: 保存未完成任务, 用 goria resume 恢复 (空 关闭)
