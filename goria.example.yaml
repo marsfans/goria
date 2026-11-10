@@ -19,6 +19,7 @@ user-agent: goria/1.0
 # retry-delay: 2
 # data:
 #   - "a=1"
+# sftp-private-key: ~/.ssh/id_ed25519   # SFTP 登录私钥
 # http11: false        # 强制 HTTP/1.1 (命令行 --http1.1)
 # http2: false         # 要求协商出 HTTP/2
 # http3: false         # 先试 HTTP/3 再回落

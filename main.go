@@ -51,6 +51,7 @@ type Options struct {
 	User           string   `mapstructure:"user"`
 	CACert         string   `mapstructure:"cacert"`
 	Cert           string   `mapstructure:"cert"`
+	SFTPKey        string   `mapstructure:"sftp-private-key"`
 	Key            string   `mapstructure:"key"`
 	Compressed     bool     `mapstructure:"compressed"`
 	IPv4           bool     `mapstructure:"ipv4"`
@@ -191,6 +192,7 @@ func main() {
 	f.StringP("user", "u", "", "Basic Auth: user:password")
 	f.String("cacert", "", "校验服务器用的 CA 证书文件 (PEM)")
 	f.String("cert", "", "客户端证书文件 (PEM, 须与 --key 成对)")
+	f.String("sftp-private-key", "", "SFTP 登录私钥文件 (缺省尝试 ~/.ssh/id_ed25519、id_rsa、id_ecdsa 与 SSH agent)")
 	f.String("key", "", "客户端证书私钥文件 (PEM, 须与 --cert 成对)")
 	f.Bool("compressed", false, "请求压缩传输并自动解压 (单连接路径)")
 	f.BoolP("ipv4", "4", false, "仅使用 IPv4")
@@ -430,9 +432,16 @@ func runJobs(opt *Options, jobs []job) error {
 		jopt := j.opt
 		low := strings.ToLower(a)
 		isBT := strings.HasPrefix(low, "magnet:") || (strings.HasSuffix(low, ".torrent") && !strings.Contains(low, "://"))
+		isFTP := strings.HasPrefix(low, "ftp://") || strings.HasPrefix(low, "ftps://")
+		isSFTP := strings.HasPrefix(low, "sftp://")
 		kind := "HTTP"
-		if isBT {
+		switch {
+		case isBT:
 			kind = " BT "
+		case isFTP:
+			kind = " FTP"
+		case isSFTP:
+			kind = "SFTP"
 		}
 		custom := isCustomRequest(jopt) || jopt.Head
 		task := ui.NewTask(displayName(a), kind)
@@ -469,6 +478,12 @@ func runJobs(opt *Options, jobs []job) error {
 				if c, err = getBT(); err == nil {
 					err = c.Download(tctx, a, task, ui)
 				}
+			case (isFTP || isSFTP) && custom:
+				err = fmt.Errorf("curl 请求参数 (-X/--data/-F/-I/--include) 不适用于 FTP/SFTP 任务")
+			case isFTP:
+				err = DownloadFTP(tctx, a, jopt, task, ui)
+			case isSFTP:
+				err = DownloadSFTP(tctx, a, jopt, task, ui)
 			case strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://"):
 				err = DownloadHTTP(tctx, a, jopt, task, ui)
 			default:

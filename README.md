@@ -4,6 +4,11 @@
 
 功能: HTTP/HTTPS 多连接分段下载、断点续传 (.goria 控制文件)、并发任务、全局限速、代理、自定义 Header、失败重试、sha256/sha1/md5 校验、BT 种子与磁力链接、做种、会话持久化 (goria resume)、curl 兼容参数 (见下节)。
 
+协议: HTTP/HTTPS (含 HTTP/2、HTTP/3)、FTP/FTPS、SFTP、BitTorrent/磁力链接。FTP/SFTP 同样支持分片下载与 .goria 断点续传、限速与校验:
+
+- FTP: `goria ftp://user:pass@host/path/file` (凭据也可 `-u user:pass`, 缺省匿名; 被动模式, 每段一连接走 REST; `ftps://` 为显式 TLS; 服务器不支持 SIZE 时回落单连接; --proxy 不适用于 FTP)
+- SFTP: `goria sftp://user@host/path/file` (密码/私钥/SSH agent 认证, `--sftp-private-key` 指定私钥, 缺省尝试 `~/.ssh/id_ed25519` 等与 agent; 有 known_hosts 时严格校验主机密钥; 代理仅支持 socks5)。两者均只下单文件, 不递归目录; `--range/--continue-at` 与 curl 请求参数不适用于 FTP/SFTP
+
 ```
 goria -x 16 https://example.com/big.iso
 goria -d ./dl -j 3 -i urls.txt
