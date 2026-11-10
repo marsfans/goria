@@ -88,8 +88,9 @@ type Options struct {
 
 	limiter   *rate.Limiter
 	minSplitB int64
-	rangeBase int64 // --range 解析后的起始偏移 (文件内写入偏移基准), 0 表示普通下载
-	rangeEnd  int64 // --range 解析后的结束偏移 (含), -1 表示未用 --range
+	rangeBase int64    // --range 解析后的起始偏移 (文件内写入偏移基准), 0 表示普通下载
+	rangeEnd  int64    // --range 解析后的结束偏移 (含), -1 表示未用 --range
+	mirrors   []string // 同一文件的镜像 URL (Metalink 注入): probe 逐个试, 分段按段轮换并故障转移
 }
 
 // retryDelay 第 try 次重试前的等待时长 (try 从 0 计)
@@ -434,6 +435,8 @@ func runJobs(opt *Options, jobs []job) error {
 		isBT := strings.HasPrefix(low, "magnet:") || (strings.HasSuffix(low, ".torrent") && !strings.Contains(low, "://"))
 		isFTP := strings.HasPrefix(low, "ftp://") || strings.HasPrefix(low, "ftps://")
 		isSFTP := strings.HasPrefix(low, "sftp://")
+		isHLS := strings.HasSuffix(low, ".m3u8")
+		isMetalink := strings.HasSuffix(low, ".metalink") || strings.HasSuffix(low, ".meta4")
 		kind := "HTTP"
 		switch {
 		case isBT:
@@ -442,6 +445,10 @@ func runJobs(opt *Options, jobs []job) error {
 			kind = " FTP"
 		case isSFTP:
 			kind = "SFTP"
+		case isHLS:
+			kind = " HLS"
+		case isMetalink:
+			kind = "META"
 		}
 		custom := isCustomRequest(jopt) || jopt.Head
 		task := ui.NewTask(displayName(a), kind)
@@ -484,6 +491,12 @@ func runJobs(opt *Options, jobs []job) error {
 				err = DownloadFTP(tctx, a, jopt, task, ui)
 			case isSFTP:
 				err = DownloadSFTP(tctx, a, jopt, task, ui)
+			case (isHLS || isMetalink) && custom:
+				err = fmt.Errorf("curl 请求参数 (-X/--data/-F/-I/--include) 不适用于 HLS/Metalink 任务")
+			case isHLS:
+				err = DownloadHLS(tctx, a, jopt, task, ui)
+			case isMetalink:
+				err = DownloadMetalink(tctx, a, jopt, task, ui)
 			case strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://"):
 				err = DownloadHTTP(tctx, a, jopt, task, ui)
 			default:

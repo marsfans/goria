@@ -254,13 +254,21 @@ func DownloadHTTP(ctx context.Context, u string, opt *Options, task *Task, ui *U
 		return doCustomRequest(ctx, c, u, opt, task, ui)
 	}
 
+	urls := append([]string{u}, opt.mirrors...)
+	probeIdx := 0 // probe 成功的镜像下标, 分段轮换从它开始 (主源挂时不再每段先撞死源)
 	var size int64
 	var ranges bool
 	var name, etag string
 	var hdr http.Header
 	var status string
-	for try := 0; try <= opt.Retries; try++ { // 探测失败 (如 429/5xx) 时重试
-		if size, ranges, name, etag, hdr, status, err = probe(ctx, c, u, opt); err == nil || err == errNotModified || errors.Is(err, errProtoMismatch) || ctx.Err() != nil {
+	for try := 0; try <= opt.Retries; try++ { // 探测失败 (如 429/5xx) 时重试, 多镜像逐个试
+		for ci, cand := range urls {
+			if size, ranges, name, etag, hdr, status, err = probe(ctx, c, cand, opt); err == nil || err == errNotModified || errors.Is(err, errProtoMismatch) || ctx.Err() != nil {
+				probeIdx = ci
+				break
+			}
+		}
+		if err == nil || err == errNotModified || errors.Is(err, errProtoMismatch) || ctx.Err() != nil {
 			break
 		}
 		select {
@@ -399,18 +407,26 @@ func DownloadHTTP(ctx context.Context, u string, opt *Options, task *Task, ui *U
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(ctl.Segments))
-	for _, s := range ctl.Segments {
+	for idx, s := range ctl.Segments {
 		if dlSize > 0 && s.Start+s.Done > s.End {
 			continue
 		}
 		wg.Add(1)
-		go func(s *Segment) {
+		go func(idx int, s *Segment) {
 			defer wg.Done()
 			task.SetConns(active.Add(1))
 			defer func() { task.SetConns(active.Add(-1)) }()
 			var err error
 			for try := 0; try <= opt.Retries; try++ {
-				if err = fetchSegment(ctx, c, u, opt, fh, s, ranges, task, ui, &mu); err == nil || ctx.Err() != nil {
+				// 一轮内依次试所有镜像 (从 probe 成功源+段序号起轮换): fetchSegment
+				// 按 seg.Done 续拉, 中途换源安全; 全部镜像都失败才算一次重试
+				for k := 0; k < len(urls); k++ {
+					fu := urls[(probeIdx+idx+k)%len(urls)]
+					if err = fetchSegment(ctx, c, fu, opt, fh, s, ranges, task, ui, &mu); err == nil || ctx.Err() != nil {
+						break
+					}
+				}
+				if err == nil || ctx.Err() != nil {
 					break
 				}
 				time.Sleep(opt.retryDelay(try))
@@ -418,7 +434,7 @@ func DownloadHTTP(ctx context.Context, u string, opt *Options, task *Task, ui *U
 			if err != nil {
 				errCh <- err
 			}
-		}(s)
+		}(idx, s)
 	}
 	wg.Wait()
 	close(stop)
