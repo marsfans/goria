@@ -41,8 +41,83 @@ type Options struct {
 	Quiet       bool     `mapstructure:"quiet"`
 	SaveSession string   `mapstructure:"save-session"`
 
+	// curl 兼容参数 (见 curl.go); 与 aria2 命名冲突的只提供长名:
+	// -d 已是 dir (curl 为 --data)、-x 已是 split (curl 为 proxy)、
+	// -k 已是 min-split-size (curl 为 insecure)、-m 已是 max-tries (curl 为 max-time)、
+	// -i 已是 input-file (curl 为 include), 这些短名保持原义不改。
+	Referer        string   `mapstructure:"referer"`
+	Cookie         string   `mapstructure:"cookie"`
+	CookieJar      string   `mapstructure:"cookie-jar"`
+	User           string   `mapstructure:"user"`
+	CACert         string   `mapstructure:"cacert"`
+	Cert           string   `mapstructure:"cert"`
+	Key            string   `mapstructure:"key"`
+	Compressed     bool     `mapstructure:"compressed"`
+	IPv4           bool     `mapstructure:"ipv4"`
+	IPv6           bool     `mapstructure:"ipv6"`
+	ConnectTimeout float64  `mapstructure:"connect-timeout"` // 秒
+	MaxTime        float64  `mapstructure:"max-time"`        // 秒, 单任务总超时
+	RetryDelay     float64  `mapstructure:"retry-delay"`     // 秒, 0 = 指数退避
+	MaxRedirs      int      `mapstructure:"max-redirs"`      // -1 = Go 默认 (10)
+	NoLocation     bool     `mapstructure:"no-location"`
+	Location       bool     `mapstructure:"location"`
+	Fail           bool     `mapstructure:"fail"`
+	ContinueAt     string   `mapstructure:"continue-at"`
+	Range          string   `mapstructure:"range"`
+	TimeCond       string   `mapstructure:"time-cond"`
+	CreateDirs     bool     `mapstructure:"create-dirs"`
+	RemoteName     bool     `mapstructure:"remote-name"`        // -O: goria 本就默认用远程文件名, 接受作兼容
+	RemoteHeadName bool     `mapstructure:"remote-header-name"` // -J: 同上, 默认已用 Content-Disposition
+	Head           bool     `mapstructure:"head"`
+	DumpHeader     string   `mapstructure:"dump-header"`
+	Include        bool     `mapstructure:"include"`
+	Verbose        bool     `mapstructure:"verbose"`
+	Silent         bool     `mapstructure:"silent"`
+	ShowError      bool     `mapstructure:"show-error"`
+	Method         string   `mapstructure:"request"`
+	Data           []string `mapstructure:"data"`
+	DataBinary     []string `mapstructure:"data-binary"`
+	DataRaw        []string `mapstructure:"data-raw"`
+	DataURLEncode  []string `mapstructure:"data-urlencode"`
+	Form           []string `mapstructure:"form"`
+
 	limiter   *rate.Limiter
 	minSplitB int64
+	rangeBase int64 // --range 解析后的起始偏移 (文件内写入偏移基准), 0 表示普通下载
+	rangeEnd  int64 // --range 解析后的结束偏移 (含), -1 表示未用 --range
+}
+
+// retryDelay 第 try 次重试前的等待时长 (try 从 0 计)
+func (o *Options) retryDelay(try int) time.Duration {
+	if o.RetryDelay > 0 {
+		return time.Duration(o.RetryDelay * float64(time.Second))
+	}
+	return time.Duration(try+1) * time.Second
+}
+
+// applyCurlAliases 把 curl 别名参数的值并入主参数 (别名以独立 viper 键注册,
+// 来源同样可以是命令行/环境变量/配置文件, 非空/非零时覆盖主参数)
+func applyCurlAliases(opt *Options) {
+	if v := viper.GetString("limit-rate"); v != "" {
+		opt.MaxSpeed = v
+	}
+	if v := viper.GetString("proxy"); v != "" {
+		opt.Proxy = v
+	}
+	if v := viper.GetString("output-dir"); v != "" {
+		opt.Dir = v
+	}
+	if v := viper.GetInt("parallel-max"); v != 0 {
+		opt.MaxJobs = v
+	}
+	if v := viper.GetString("agent"); v != "" {
+		opt.UserAgent = v
+	}
+	if viper.IsSet("retry") {
+		if v := viper.GetInt("retry"); v >= 0 {
+			opt.Retries = v
+		}
+	}
 }
 
 var cfgFile string
@@ -68,6 +143,7 @@ func main() {
 			if !cmd.Flags().Changed("out") {
 				opt.Out = "" // -o 不从配置文件继承
 			}
+			applyCurlAliases(opt)
 			return run(opt, args)
 		},
 	}
@@ -91,6 +167,51 @@ func main() {
 	f.String("all-proxy", "", "代理: http://host:port 或 socks5://host:port")
 	f.BoolP("quiet", "q", false, "不显示进度条, 只输出日志")
 	root.PersistentFlags().String("save-session", "", "会话文件: 保存未完成任务, 供 goria resume 恢复 (空 关闭)")
+
+	// ---- curl 兼容参数 (语义见 curl.go; 与 aria2 冲突的短名保持原义) ----
+	f.StringP("referer", "e", "", "Referer 头")
+	f.StringP("cookie", "b", "", "Cookie: 'a=b; c=d', 或 Netscape 格式 cookie 文件路径")
+	f.StringP("cookie-jar", "c", "", "把响应 Cookie 保存到该文件 (Netscape 格式)")
+	f.StringP("user", "u", "", "Basic Auth: user:password")
+	f.String("cacert", "", "校验服务器用的 CA 证书文件 (PEM)")
+	f.String("cert", "", "客户端证书文件 (PEM, 须与 --key 成对)")
+	f.String("key", "", "客户端证书私钥文件 (PEM, 须与 --cert 成对)")
+	f.Bool("compressed", false, "请求压缩传输并自动解压 (单连接路径)")
+	f.BoolP("ipv4", "4", false, "仅使用 IPv4")
+	f.BoolP("ipv6", "6", false, "仅使用 IPv6")
+	f.Float64("connect-timeout", 0, "连接超时 (秒, 支持小数)")
+	f.Float64("max-time", 0, "单任务总超时 (秒, 支持小数; curl 的 -m, 本工具短名已被重试次数占用)")
+	f.Float64("retry-delay", 0, "重试间隔 (秒, 0 = 指数退避)")
+	f.Int("max-redirs", -1, "最大重定向次数 (-1 = 默认 10)")
+	f.BoolP("location", "L", false, "跟随重定向 (本就默认跟随, 接受作兼容)")
+	f.Bool("no-location", false, "不跟随重定向 (3xx 视为结果/错误)")
+	f.BoolP("fail", "f", false, "HTTP 状态 >=400 时失败且不保存响应体 (单连接请求路径; 普通下载本就对错误状态失败)")
+	f.StringP("continue-at", "C", "", "从指定偏移续传: - 表示自动 (默认行为), 或字节数如 4096")
+	f.StringP("range", "r", "", "只下载指定字节区间, 如 0-499 / 500- / -500")
+	f.StringP("time-cond", "z", "", "条件下载 (If-Modified-Since): 日期, 或 @文件/文件路径取其修改时间; 服务器未修改 (304) 时跳过")
+	f.Bool("create-dirs", false, "-o 含子路径时自动创建目录")
+	f.BoolP("remote-name", "O", false, "使用远程文件名 (本就默认, 接受作兼容)")
+	f.BoolP("remote-header-name", "J", false, "使用 Content-Disposition 文件名 (本就默认, 接受作兼容)")
+	f.BoolP("head", "I", false, "只发 HEAD 请求并输出响应头, 不下载")
+	f.StringP("dump-header", "D", "", "把响应头写到该文件 ('-' 写到 stderr)")
+	f.Bool("include", false, "把响应头也写入输出文件 (单连接请求路径; -i 短名已被任务列表占用)")
+	f.BoolP("verbose", "v", false, "输出请求/响应行与头 (Authorization/Cookie 脱敏)")
+	f.BoolP("silent", "s", false, "静默: 不显示进度与普通日志")
+	f.BoolP("show-error", "S", false, "与 -s 同用时仍显示错误")
+	f.StringP("request", "X", "", "HTTP 方法, 如 POST/PUT/DELETE (有 --data/--form 时默认 POST)")
+	f.StringArray("data", nil, "发送表单数据 (等价 curl --data): 可重复, @文件 读文件并去换行; 多段以 & 连接")
+	f.StringArray("data-binary", nil, "同 --data 但 @文件 按原样发送")
+	f.StringArray("data-raw", nil, "同 --data 但 @ 不特殊处理")
+	f.StringArray("data-urlencode", nil, "同 --data 但每段先做 URL 编码: content / name=content / @文件 / name@文件")
+	f.StringArrayP("form", "F", nil, "multipart 表单: name=value / name=@文件[;type=类型;filename=名] / name=<文件")
+	// 纯别名 (并入主参数, 见 applyCurlAliases)
+	f.String("limit-rate", "", "--max-speed 的 curl 别名")
+	f.String("proxy", "", "--all-proxy 的 curl 别名 (curl 的 -x 短名已被分片数占用)")
+	f.String("output-dir", "", "--dir 的 curl 别名")
+	f.Int("parallel-max", 0, "--max-concurrent-downloads 的 curl 别名")
+	f.BoolP("parallel", "Z", false, "并行下载 (本就默认并行, 接受作兼容)")
+	f.StringP("agent", "A", "", "--user-agent 的 curl 别名")
+	f.Int("retry", -1, "--max-tries 的 curl 别名")
 
 	root.AddCommand(&cobra.Command{
 		Use:   "config",
@@ -124,6 +245,7 @@ func main() {
 			if !cmd.Flags().Changed("out") {
 				opt.Out = "" // -o 不从配置文件继承
 			}
+			applyCurlAliases(opt)
 			path := opt.SaveSession
 			if path == "" {
 				path = defaultSessionPath()
@@ -212,6 +334,9 @@ func run(opt *Options, args []string) error {
 }
 
 func runJobs(opt *Options, jobs []job) error {
+	if err := validateOptions(opt); err != nil {
+		return err
+	}
 	if opt.MaxJobs < 1 {
 		opt.MaxJobs = 1
 	}
@@ -240,7 +365,9 @@ func runJobs(opt *Options, jobs []job) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	ui := NewUI(opt.Quiet)
+	ui := NewUI(opt.Quiet || opt.Silent)
+	ui.silent = opt.Silent
+	ui.showError = opt.ShowError
 	ui.Start()
 
 	var tracker *SessionTracker
@@ -286,8 +413,10 @@ func runJobs(opt *Options, jobs []job) error {
 		if isBT {
 			kind = " BT "
 		}
+		custom := isCustomRequest(jopt) || jopt.Head
 		task := ui.NewTask(displayName(a), kind)
-		if tracker != nil {
+		if tracker != nil && !custom {
+			// 单连接请求任务不入会话: 其方法/请求体不做持久化 (可能含敏感数据), resume 无法忠实恢复
 			tracker.add(task, entryFor(a, isBT, jopt))
 		}
 		wg.Add(1)
@@ -304,15 +433,23 @@ func runJobs(opt *Options, jobs []job) error {
 				tracker.markStarted(task)
 			}
 			task.SetState(StateActive)
+			tctx := ctx
+			if jopt.MaxTime > 0 { // curl --max-time: 单任务总超时
+				var cancel2 context.CancelFunc
+				tctx, cancel2 = context.WithTimeout(ctx, time.Duration(jopt.MaxTime*float64(time.Second)))
+				defer cancel2()
+			}
 			var err error
 			switch {
+			case isBT && custom:
+				err = fmt.Errorf("curl 请求参数 (-X/--data/-F/-I/--include) 不适用于 BT 任务")
 			case isBT:
 				var c *BTClient
 				if c, err = getBT(); err == nil {
-					err = c.Download(ctx, a, task, ui)
+					err = c.Download(tctx, a, task, ui)
 				}
 			case strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://"):
-				err = DownloadHTTP(ctx, a, jopt, task, ui)
+				err = DownloadHTTP(tctx, a, jopt, task, ui)
 			default:
 				err = fmt.Errorf("不支持的协议: %q", a)
 			}

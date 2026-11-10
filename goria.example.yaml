@@ -10,6 +10,15 @@ user-agent: goria/1.0
 # all-proxy: socks5://127.0.0.1:1080
 # header:
 #   - "Referer: https://example.com"
+# curl 兼容参数同样可写 (键名即长参数名), 如:
+# referer: https://example.com
+# cookie: "sid=42"
+# user: "alice:secret"
+# connect-timeout: 10
+# max-time: 600
+# retry-delay: 2
+# data:
+#   - "a=1"
 seed-ratio: 0                  # BT 做种分享率
 listen-port: 0
 # save-session: ~/.config/goria/session.json   # 会话文件: 保存未完成任务, 用 goria resume 恢复 (空 关闭)

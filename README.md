@@ -2,7 +2,7 @@
 
 库: cobra + pflag (CLI) / viper (配置 + 环境变量) / lipgloss + termenv (多任务进度条) / pterm (日志、汇总表) / anacrolix/torrent (BT) / x/time/rate (限速)
 
-功能: HTTP/HTTPS 多连接分段下载、断点续传 (.goria 控制文件)、并发任务、全局限速、代理、自定义 Header、失败重试、sha256/sha1/md5 校验、BT 种子与磁力链接、做种、会话持久化 (goria resume)。
+功能: HTTP/HTTPS 多连接分段下载、断点续传 (.goria 控制文件)、并发任务、全局限速、代理、自定义 Header、失败重试、sha256/sha1/md5 校验、BT 种子与磁力链接、做种、会话持久化 (goria resume)、curl 兼容参数 (见下节)。
 
 ```
 goria -x 16 https://example.com/big.iso
@@ -14,6 +14,37 @@ goria ./ubuntu.torrent --seed-ratio 1.0
 goria --save-session ./session.json -i urls.txt   # 保存未完成任务到会话文件
 goria resume                                       # 恢复未完成任务
 goria config            # 查看生效配置
+```
+
+## curl 兼容参数
+
+常用 curl 参数名可以直接用 (含配置文件键与环境变量 `GORIA_*`)。与 aria2 命名冲突的短名保持原义、只提供长名: `-d` 仍是保存目录 (发送数据用 `--data`)、`-x` 仍是分片数 (代理用 `--proxy`)、`-m` 仍是重试次数 (超时用 `--max-time`)、`-i` 仍是任务列表 (响应头入文件用 `--include`)、`-k` 仍是最小分片 (`--insecure` 本就同名)。
+
+第一档 (下载行为):
+
+- 别名: `-A` = `--user-agent`、`--limit-rate` = `--max-speed`、`--proxy` = `--all-proxy`、`--output-dir` = `--dir`、`-Z/--parallel-max` = `-j`、`--retry` = `--max-tries`、`-O/-J` (goria 本就默认用远程/Content-Disposition 文件名)
+- 请求头: `-e/--referer`、`-b/--cookie` (`a=b; c=d` 字面值, 或 Netscape 格式 cookie 文件)、`-c/--cookie-jar` 保存响应 Cookie、`-u/--user` Basic Auth
+- TLS/网络: `--cacert`、`--cert/--key` (客户端证书)、`--compressed`、`-4/--ipv4`、`-6/--ipv6`
+- 控制: `--connect-timeout`、`--max-time` (单任务总超时)、`--retry-delay`、`-L/--location` 与 `--no-location`、`--max-redirs`、`-f/--fail`、`-C/--continue-at` 按偏移续传、`-r/--range` 只下字节区间、`-z/--time-cond` 条件下载 (304 跳过)、`--create-dirs`
+
+```
+goria -A "Mozilla/5.0" -e https://ref.example/ -b "sid=42" https://example.com/a.zip
+goria -r 0-1048575 https://example.com/big.iso        # 只下第一个 MiB
+goria -z @last.zip https://example.com/last.zip       # 服务器未更新则跳过
+goria -C 4096 https://example.com/big.iso             # 从已有文件的 4096 字节处续传
+```
+
+第二档 (单连接请求): 带请求体、非 GET 方法或 `--include` 的任务不分片、不写控制文件、不可断点续传, 其余 (限速、校验、cookie-jar、会话外) 照常。会话持久化不记录这类任务 (请求体可能含敏感数据)。
+
+- `-X/--request` 方法; `--data` / `--data-binary` / `--data-raw` / `--data-urlencode` 发送数据 (`@文件` 语义与 curl 同, 多段以 `&` 连接, 有数据时默认 POST); `-F/--form` multipart (`name=value`、`name=@文件[;type=;filename=]`、`name=<文件`)
+- `-I/--head` 只取响应头; `-D/--dump-header` 响应头写文件 (`-` 为 stderr); `--include` 响应头写入输出文件开头; `-v/--verbose` 打印请求/响应 (Authorization/Cookie 脱敏); `-s/--silent` 静默, `-S/--show-error` 静默时仍显示错误
+- 状态码按 curl 语义: 默认保存响应体 (如 404 页面), 加 `-f/--fail` 后 >=400 报错且不落盘; 传输错误按 `--max-tries` 重试 (每次重发完整请求体)
+
+```
+goria -X POST --data "a=1" --data "b=2" -o resp.json https://api.example.com/submit
+goria -F "name=goria" -F "file=@a.zip" https://example.com/upload
+goria -I https://example.com/big.iso
+goria --data-urlencode "q=a b&c" -o r.txt https://example.com/search
 ```
 Ctrl+C 中断后重新运行相同命令即可续传; 开启会话持久化后可直接 `goria resume`。
 

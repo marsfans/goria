@@ -45,15 +45,17 @@ func (t *Task) SetState(s TaskState) { t.state.Store(int32(s)) }
 func (t *Task) Fail(err error)       { t.err.Store(err.Error()); t.SetState(StateFailed) }
 
 type UI struct {
-	mu      sync.Mutex
-	tasks   []*Task
-	out     *termenv.Output
-	lines   int
-	stop    chan struct{}
-	stopped chan struct{}
-	logs    []string
-	quiet   bool
-	tty     bool
+	mu        sync.Mutex
+	tasks     []*Task
+	out       *termenv.Output
+	lines     int
+	stop      chan struct{}
+	stopped   chan struct{}
+	logs      []string
+	quiet     bool
+	silent    bool // curl -s: 丢弃普通日志
+	showError bool // curl -S: silent 时仍保留错误日志
+	tty       bool
 
 	sName, sBarOn, sBarOff, sPct, sSpeed, sDim, sOK, sErr, sKind, sHead lipgloss.Style
 }
@@ -104,10 +106,26 @@ func (u *UI) log(p pterm.PrefixPrinter, format string, a ...any) {
 	u.logs = append(u.logs, line)
 	u.mu.Unlock()
 }
-func (u *UI) Info(f string, a ...any)    { u.log(pterm.Info, f, a...) }
-func (u *UI) Success(f string, a ...any) { u.log(pterm.Success, f, a...) }
-func (u *UI) Warn(f string, a ...any)    { u.log(pterm.Warning, f, a...) }
-func (u *UI) Error(f string, a ...any)   { u.log(pterm.Error, f, a...) }
+func (u *UI) Info(f string, a ...any) {
+	if !u.silent {
+		u.log(pterm.Info, f, a...)
+	}
+}
+func (u *UI) Success(f string, a ...any) {
+	if !u.silent {
+		u.log(pterm.Success, f, a...)
+	}
+}
+func (u *UI) Warn(f string, a ...any) {
+	if !u.silent {
+		u.log(pterm.Warning, f, a...)
+	}
+}
+func (u *UI) Error(f string, a ...any) {
+	if !u.silent || u.showError {
+		u.log(pterm.Error, f, a...)
+	}
+}
 
 // Summary 用 pterm 表格输出所有任务的最终结果
 func (u *UI) Summary() {
