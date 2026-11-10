@@ -1,19 +1,26 @@
 package main
 
-// 终端 UI: 用 lipgloss 渲染多任务进度, termenv 负责颜色探测与光标控制
+// 终端 UI: 进度渲染交给 vbauerster/mpb — 装饰器全部定宽, 只有条在动,
+// 名称/百分比/速度等文字钉在原位; 日志经容器 Write 打印到进度区上方。
+// Task 仍是引擎与 UI 的唯一契约 (原子计数); 同步 goroutine 每 100ms 采样
+// 速度 (实测 dt + EWMA) 并把计数推进 mpb。顶栏做成一条聚合条 (总进度),
+// 任务多到超过终端高度时多余任务折叠成一条溢出聚合条。
+// 非 TTY 或 quiet 时不启用 mpb: 日志直接打印, 结尾仍用 pterm 汇总表。
+
 import (
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
-	"github.com/muesli/termenv"
 	"github.com/pterm/pterm"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"golang.org/x/term"
 )
 
@@ -35,13 +42,16 @@ type Task struct {
 	Extra atomic.Value // string, 额外信息 (如 BT peers)
 	state atomic.Int32
 	err   atomic.Value
-	epoch atomic.Int64 // ResetFile 时递增, 渲染侧据此重置自己的速度采样
+	epoch atomic.Int64 // ResetFile 时递增, 同步侧据此重置自己的速度采样
 
-	// 以下字段仅渲染 goroutine 读写
+	// 以下字段仅 UI 同步 goroutine 读写
 	lastBytes int64
 	speed     float64 // EWMA bytes/s
 	seenEpoch int64
-	frames    int // 本 epoch 内活动帧数 (ETA 热身用)
+	barFinal  bool
+
+	frames    atomic.Int64  // 本 epoch 内活动采样数 (ETA 热身用)
+	speedView atomic.Uint64 // math.Float64bits(speed), 供 mpb 装饰器无锁读
 }
 
 func (t *Task) Add(n int64)          { t.done.Add(n) }
@@ -52,13 +62,98 @@ func (t *Task) SetState(s TaskState) { t.state.Store(int32(s)) }
 func (t *Task) Fail(err error)       { t.err.Store(err.Error()); t.SetState(StateFailed) }
 
 // ResetFile 在同一任务内切换到下一个文件 (如 Metalink 多文件): 进度清零,
-// 渲染侧在下一帧察觉 epoch 变化后重置速度采样, 不会把上个文件的字节算进来
+// 同步侧在下一次采样察觉 epoch 变化后重置速度采样, 不会把上个文件的字节算进来
 func (t *Task) ResetFile(name string) {
 	t.Name = name
 	t.done.Store(0)
 	t.total.Store(0)
 	t.conns.Store(0)
 	t.epoch.Add(1)
+}
+
+// sampleSpeed 用实测帧间隔 dt 更新 EWMA 速度 (仅 UI 同步 goroutine 调用)
+func (t *Task) sampleSpeed(dt float64) {
+	cur := t.done.Load()
+	if ep := t.epoch.Load(); ep != t.seenEpoch {
+		t.seenEpoch = ep
+		t.lastBytes = cur
+		t.speed = 0
+		t.frames.Store(0)
+	}
+	inst := float64(cur-t.lastBytes) / dt
+	t.lastBytes = cur
+	t.speed = 0.7*t.speed + 0.3*inst
+	if TaskState(t.state.Load()) == StateActive {
+		t.frames.Add(1)
+	}
+	t.speedView.Store(math.Float64bits(t.speed))
+}
+
+func (t *Task) speedNow() float64 { return math.Float64frombits(t.speedView.Load()) }
+
+// etaText 热身 (约 5 次采样) 后才给 ETA, 避免 EWMA 未收敛时乱跳
+func (t *Task) etaText() string {
+	total, cur := t.total.Load(), t.done.Load()
+	sp := t.speedNow()
+	if t.frames.Load() < 5 || sp <= 1 || total <= cur {
+		return "--:--"
+	}
+	return fmtDur(time.Duration(float64(total-cur)/sp) * time.Second)
+}
+
+// pctOrStateText 条后第一列: 活动时百分比 (钳制 100), 否则终态/等待标记
+func (t *Task) pctOrStateText() string {
+	switch TaskState(t.state.Load()) {
+	case StateDone:
+		return "✔ 完成"
+	case StateFailed:
+		return "✘ 失败"
+	case StateWaiting:
+		return "等待中…"
+	}
+	total, cur := t.total.Load(), t.done.Load()
+	if total <= 0 {
+		return "--"
+	}
+	pct := float64(cur) / float64(total)
+	if pct > 1 {
+		pct = 1 // 已下超过总量 (服务器谎报大小等) 时钳制
+	}
+	return fmt.Sprintf("%.1f%%", pct*100)
+}
+
+func (t *Task) speedText() string {
+	if TaskState(t.state.Load()) != StateActive {
+		return ""
+	}
+	return humanBytes(t.speedNow()) + "/s"
+}
+
+// infoText 条后信息列: 已下/总量、ETA、连接数与 Extra; 终态时是大小/错误
+func (t *Task) infoText() string {
+	total, cur := t.total.Load(), t.done.Load()
+	switch TaskState(t.state.Load()) {
+	case StateDone:
+		return humanBytes(float64(cur))
+	case StateFailed:
+		e, _ := t.err.Load().(string)
+		return trunc(e, 50)
+	case StateWaiting:
+		return ""
+	}
+	size := humanBytes(float64(cur))
+	if total > 0 {
+		size += "/" + humanBytes(float64(total))
+	}
+	info := " " + size
+	if c := t.conns.Load(); c > 0 {
+		info += fmt.Sprintf("  连接 %d", c)
+	}
+	info += "  ETA " + t.etaText()
+	if ex, _ := t.Extra.Load().(string); ex != "" {
+		info += "  " + ex
+	}
+	return info
 }
 
 // 统一计数入口: 引擎把字节流过包装器即自动计入进度, 不再各自手调 Add,
@@ -93,54 +188,74 @@ func (tw taskWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+// uiStats 一组任务的聚合统计 (顶栏聚合条与溢出条共用)
+type uiStats struct {
+	active, waiting, done, failed int
+	sumDone, sumTotal             int64 // 仅统计已知大小的任务
+}
+
+func aggregateStats(tasks []*Task) uiStats {
+	var s uiStats
+	for _, t := range tasks {
+		switch TaskState(t.state.Load()) {
+		case StateActive:
+			s.active++
+		case StateWaiting:
+			s.waiting++
+		case StateDone:
+			s.done++
+		case StateFailed:
+			s.failed++
+		}
+		if tot := t.total.Load(); tot > 0 {
+			s.sumTotal += tot
+			s.sumDone += min(t.done.Load(), tot)
+		}
+	}
+	return s
+}
+
+type statsSnap struct {
+	uiStats
+	speed float64 // 活动任务速度之和
+	n     int     // 任务总数
+}
+
 type UI struct {
-	mu        sync.Mutex // 只护 tasks 与 logs 两个切片
+	mu        sync.Mutex // 护 tasks/bars/overTasks/p
 	tasks     []*Task
-	out       *termenv.Output
-	lines     int
-	stop      chan struct{}
-	stopped   chan struct{}
-	logs      []string
 	quiet     bool
 	silent    bool // curl -s: 丢弃普通日志
 	showError bool // curl -S: silent 时仍保留错误日志
 	tty       bool
 	height    int // 终端行数, 0 = 未知 (不封顶)
 
-	// 以下字段仅渲染 goroutine 读写
-	lastFrame string
-	lastAt    time.Time
-
-	sName, sBarOn, sBarOff, sPct, sSpeed, sDim, sOK, sErr, sKind, sHead lipgloss.Style
+	logOut    io.Writer // 直打路径的日志出口, nil = os.Stdout (测试可替换捕获)
+	p         *mpb.Progress
+	bars      map[*Task]*mpb.Bar
+	overTasks []*Task
+	sumBar    *mpb.Bar
+	overBar   *mpb.Bar
+	sumFinal  bool
+	overFinal bool
+	statsSnap atomic.Value // statsSnap
+	overSnap  atomic.Value // uiStats
+	syncStop  chan struct{}
+	syncDone  chan struct{}
 }
 
 func NewUI(quiet bool) *UI {
-	out := termenv.NewOutput(os.Stdout)
-	lipgloss.SetColorProfile(out.Profile)
 	if !isTTY() {
 		pterm.DisableStyling()
 	}
-	u := &UI{
-		out: out, quiet: quiet,
-		tty:     isTTY(),
-		stop:    make(chan struct{}),
-		stopped: make(chan struct{}),
-		sName:   lipgloss.NewStyle().Width(26).Foreground(lipgloss.Color("252")),
-		sBarOn:  lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")),
-		sBarOff: lipgloss.NewStyle().Foreground(lipgloss.Color("238")),
-		sPct:    lipgloss.NewStyle().Width(7).Align(lipgloss.Right).Bold(true),
-		sSpeed:  lipgloss.NewStyle().Width(11).Align(lipgloss.Right).Foreground(lipgloss.Color("#04B575")),
-		sDim:    lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
-		sOK:     lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Bold(true),
-		sErr:    lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87")).Bold(true),
-		sKind:   lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("#7D56F4")).Padding(0, 1),
-		sHead:   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7D56F4")),
-	}
+	u := &UI{quiet: quiet, tty: isTTY()}
 	if u.tty {
 		if _, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
 			u.height = h
 		}
 	}
+	u.statsSnap.Store(statsSnap{})
+	u.overSnap.Store(uiStats{})
 	return u
 }
 
@@ -154,16 +269,28 @@ func (u *UI) NewTask(name, kind string) *Task {
 	t.Extra.Store("")
 	u.mu.Lock()
 	u.tasks = append(u.tasks, t)
+	if u.p != nil {
+		u.attachLocked(t)
+	}
 	u.mu.Unlock()
 	return t
 }
 
-// 日志: 用 pterm 的前缀打印器渲染, 显示在进度区上方
+// 日志: mpb 启用时经容器 Write 打印到进度区上方 (下个刷新周期冲出), 否则直打
 func (u *UI) log(p pterm.PrefixPrinter, format string, a ...any) {
 	line := strings.TrimRight(p.Sprintf(format, a...), "\n")
 	u.mu.Lock()
-	u.logs = append(u.logs, line)
+	prog := u.p
 	u.mu.Unlock()
+	if prog != nil {
+		prog.Write([]byte(line + "\n"))
+		return
+	}
+	w := u.logOut
+	if w == nil {
+		w = os.Stdout
+	}
+	fmt.Fprintln(w, line)
 }
 func (u *UI) Info(f string, a ...any) {
 	if !u.silent {
@@ -188,8 +315,11 @@ func (u *UI) Error(f string, a ...any) {
 
 // Summary 用 pterm 表格输出所有任务的最终结果
 func (u *UI) Summary() {
+	u.mu.Lock()
+	tasks := append([]*Task(nil), u.tasks...)
+	u.mu.Unlock()
 	data := pterm.TableData{{"类型", "名称", "大小", "状态"}}
-	for _, t := range u.tasks {
+	for _, t := range tasks {
 		status := pterm.Green("✔ 完成")
 		switch TaskState(t.state.Load()) {
 		case StateFailed:
@@ -204,213 +334,208 @@ func (u *UI) Summary() {
 	pterm.DefaultTable.WithHasHeader().WithBoxed().WithData(data).Render()
 }
 
-func (u *UI) Start() {
-	if u.tty {
-		u.out.HideCursor()
+// taskBarCap 任务条行数上限: 顶栏聚合条 1 行 + 溢出条预留 1 行 + 余量 1 行
+func (u *UI) taskBarCap() int {
+	if u.height <= 0 {
+		return 1 << 30
 	}
-	go func() {
-		defer close(u.stopped)
-		tm := time.NewTimer(100 * time.Millisecond)
-		defer tm.Stop()
-		for {
-			select {
-			case <-tm.C:
-				u.render()
-				tm.Reset(u.renderInterval())
-			case <-u.stop:
-				u.render()
-				return
-			}
-		}
-	}()
+	return max(1, u.height-3)
 }
 
-// renderInterval 自适应帧率: 有活动任务时 100ms 跟手, 全静止时 500ms 省电省 IO
-// (速度按实测帧间隔计算, 变帧率不影响数值准确性)
-func (u *UI) renderInterval() time.Duration {
+func barStyle() mpb.BarStyleComposer {
+	return mpb.BarStyle().Lbound("").Filler("█").Tip("█").Padding("░").Rbound("")
+}
+
+// attachLocked 给任务建条; 超过高度上限的进溢出组 (调用方持 u.mu)
+func (u *UI) attachLocked(t *Task) {
+	if len(u.bars) < u.taskBarCap() {
+		u.bars[t] = u.makeTaskBar(t)
+		return
+	}
+	u.overTasks = append(u.overTasks, t)
+	if u.overBar == nil {
+		u.overBar = u.p.New(0,
+			barStyle(),
+			mpb.BarWidth(24),
+			mpb.PrependDecorators(decor.Any(func(decor.Statistics) string {
+				s := u.overSnap.Load().(uiStats)
+				n := s.active + s.waiting + s.done + s.failed
+				return fmt.Sprintf("… 另有 %d 个任务 (完成 %d · 失败 %d · 等待 %d · 活动 %d)", n, s.done, s.failed, s.waiting, s.active)
+			}, decor.WC{W: 46})),
+		)
+	}
+}
+
+func (u *UI) makeTaskBar(t *Task) *mpb.Bar {
+	return u.p.New(max(t.total.Load(), 0),
+		barStyle(),
+		mpb.BarWidth(24),
+		mpb.PrependDecorators(
+			decor.Any(func(decor.Statistics) string { return t.Kind }, decor.WC{W: 4, C: decor.DSyncSpace}),
+			decor.Any(func(decor.Statistics) string { return trunc(t.Name, 20) }, decor.WC{W: 20, C: decor.DSyncSpace}),
+		),
+		mpb.AppendDecorators(
+			decor.Any(func(decor.Statistics) string { return t.pctOrStateText() }, decor.WC{W: 8, C: decor.DSyncSpaceR}),
+			decor.Any(func(decor.Statistics) string { return t.speedText() }, decor.WC{W: 11, C: decor.DSyncSpaceR}),
+			decor.Any(func(decor.Statistics) string { return t.infoText() }),
+		),
+	)
+}
+
+func (u *UI) makeSumBarLocked() {
+	u.sumBar = u.p.New(0,
+		barStyle(),
+		mpb.BarWidth(24),
+		mpb.PrependDecorators(decor.Any(func(decor.Statistics) string {
+			s := u.statsSnap.Load().(statsSnap)
+			return fmt.Sprintf("goria  活动 %d · 完成 %d/%d · 总速度 %s/s",
+				s.active, s.done+s.failed, s.n, humanBytes(s.speed))
+		}, decor.WC{W: 46})),
+		mpb.AppendDecorators(decor.Any(func(decor.Statistics) string {
+			s := u.statsSnap.Load().(statsSnap)
+			if s.sumTotal <= 0 {
+				return ""
+			}
+			return fmt.Sprintf("总进度 %.1f%% (%s/%s)",
+				float64(s.sumDone)/float64(s.sumTotal)*100, humanBytes(float64(s.sumDone)), humanBytes(float64(s.sumTotal)))
+		})),
+	)
+}
+
+func (u *UI) Start() {
+	if u.quiet || !u.tty {
+		return
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	for _, t := range u.tasks {
-		if TaskState(t.state.Load()) == StateActive {
-			return 100 * time.Millisecond
-		}
+	if u.p != nil {
+		return
 	}
-	return 500 * time.Millisecond
+	u.p = mpb.New(mpb.WithOutput(os.Stdout), mpb.WithRefreshRate(120*time.Millisecond))
+	u.bars = map[*Task]*mpb.Bar{}
+	u.makeSumBarLocked()
+	for _, t := range u.tasks {
+		u.attachLocked(t)
+	}
+	u.syncStop = make(chan struct{})
+	u.syncDone = make(chan struct{})
+	go u.syncLoop()
 }
 
 func (u *UI) Stop() {
-	close(u.stop)
-	<-u.stopped
-	if u.tty {
-		u.out.ShowCursor()
+	u.mu.Lock()
+	p := u.p
+	u.mu.Unlock()
+	if p == nil {
+		return
+	}
+	close(u.syncStop)
+	<-u.syncDone
+	u.syncOnce(0.1, true)
+	u.mu.Lock()
+	u.p = nil
+	u.mu.Unlock()
+	p.Wait()
+}
+
+func (u *UI) syncLoop() {
+	defer close(u.syncDone)
+	tk := time.NewTicker(100 * time.Millisecond)
+	defer tk.Stop()
+	last := time.Now()
+	for {
+		select {
+		case <-u.syncStop:
+			return
+		case now := <-tk.C:
+			dt := now.Sub(last).Seconds()
+			last = now
+			if dt < 0.05 {
+				dt = 0.05
+			}
+			u.syncOnce(dt, false)
+		}
 	}
 }
 
-// render 渲染一帧: 锁内只摘走日志与任务快照, 拼装与终端写入都在锁外,
-// 慢终端不会反过来堵住引擎打日志; 帧内容与上一帧相同且无新日志时整帧跳过
-func (u *UI) render() {
+// syncOnce 采样全部任务速度、刷新聚合快照, 并把计数推进 mpb; final 时定格所有条
+func (u *UI) syncOnce(dt float64, final bool) {
 	u.mu.Lock()
-	logs := u.logs
-	u.logs = nil
 	tasks := append([]*Task(nil), u.tasks...)
+	over := append([]*Task(nil), u.overTasks...)
+	sumBar, overBar := u.sumBar, u.overBar
+	bars := u.bars
 	u.mu.Unlock()
 
-	if u.quiet || !u.tty {
-		for _, l := range logs {
-			fmt.Fprintln(u.out, l)
-		}
-		return
-	}
-	now := time.Now()
-	dt := 0.2
-	if !u.lastAt.IsZero() {
-		dt = now.Sub(u.lastAt).Seconds()
-	}
-	u.lastAt = now
-	if dt < 0.05 {
-		dt = 0.05 // 两帧紧挨 (如 Stop 的收尾帧) 时防速度尖峰
-	}
-	frame := u.buildFrame(tasks, dt)
-	if len(logs) == 0 && frame == u.lastFrame {
-		return
-	}
-	if u.lines > 0 {
-		u.out.ClearLines(u.lines)
-		fmt.Fprint(u.out, "\r")
-	}
-	for _, l := range logs {
-		fmt.Fprintln(u.out, l)
-	}
-	fmt.Fprint(u.out, frame)
-	u.lastFrame = frame
-	u.lines = strings.Count(frame, "\n")
-}
-
-// buildFrame 用实测帧间隔 dt 更新各任务速度采样并拼出整帧文本 (仅渲染 goroutine 调用)
-func (u *UI) buildFrame(tasks []*Task, dt float64) string {
-	type row struct {
-		text string
-		st   TaskState
-	}
-	rows := make([]row, 0, len(tasks))
-	var totalSpeed float64
-	var sumDone, sumTotal int64
-	active, finished := 0, 0
+	var speedSum float64
 	for _, t := range tasks {
-		cur := t.done.Load()
-		if tot := t.total.Load(); tot > 0 {
-			sumTotal += tot
-			sumDone += min(cur, tot)
+		t.sampleSpeed(dt)
+		if TaskState(t.state.Load()) == StateActive {
+			speedSum += t.speedNow()
 		}
-		if ep := t.epoch.Load(); ep != t.seenEpoch {
-			t.seenEpoch = ep
-			t.lastBytes = cur
-			t.speed = 0
-			t.frames = 0
+	}
+	stats := aggregateStats(tasks)
+	u.statsSnap.Store(statsSnap{stats, speedSum, len(tasks)})
+	overStats := aggregateStats(over)
+	u.overSnap.Store(overStats)
+
+	for _, t := range tasks {
+		bar := bars[t]
+		if bar == nil {
+			continue
 		}
-		inst := float64(cur-t.lastBytes) / dt
-		t.lastBytes = cur
-		t.speed = 0.7*t.speed + 0.3*inst
 		st := TaskState(t.state.Load())
-		switch st {
-		case StateActive:
-			active++
-			t.frames++
-			totalSpeed += t.speed
-		case StateDone, StateFailed:
-			finished++
-		}
-		rows = append(rows, row{u.line(t, st), st})
-	}
-	// 展示顺序: 活动 → 等待 → 完成/失败 (组内保持原序), 封顶时先折叠终态任务
-	ordered := make([]row, 0, len(rows))
-	for _, want := range []TaskState{StateActive, StateWaiting, StateDone, StateFailed} {
-		for _, r := range rows {
-			if r.st == want {
-				ordered = append(ordered, r)
+		if final || st == StateDone || st == StateFailed {
+			finalizeTaskBar(t, bar)
+		} else {
+			if tot := t.total.Load(); tot > 0 {
+				bar.SetTotal(tot, false)
 			}
+			bar.SetCurrent(t.done.Load())
 		}
 	}
-	maxRows := len(ordered)
-	if u.height > 2 {
-		maxRows = min(maxRows, u.height-2) // 顶栏 1 行 + 至少留 1 行余量
-	}
-	var b strings.Builder
-	shown := ordered
-	var overflow string
-	if len(ordered) > maxRows {
-		shown = ordered[:max(maxRows-1, 0)]
-		hidden := ordered[len(shown):]
-		var hd, hf, hw int
-		for _, r := range hidden {
-			switch r.st {
-			case StateDone:
-				hd++
-			case StateFailed:
-				hf++
-			case StateWaiting:
-				hw++
+	if sumBar != nil {
+		if stats.sumTotal > 0 {
+			sumBar.SetTotal(stats.sumTotal, false)
+			sumBar.SetCurrent(stats.sumDone)
+		} else {
+			sumBar.SetTotal(int64(max(len(tasks), 1)), false)
+			sumBar.SetCurrent(int64(stats.done + stats.failed))
+		}
+		if final && !u.sumFinal {
+			u.sumFinal = true
+			tot := sumBar.Current()
+			if s := stats.sumTotal; s > 0 {
+				tot = s
 			}
+			if tot <= 0 {
+				tot = 1
+			}
+			sumBar.SetTotal(tot, true)
 		}
-		overflow = u.sDim.Render(fmt.Sprintf("… 另有 %d 个任务 (完成 %d · 失败 %d · 等待 %d)", len(hidden), hd, hf, hw))
 	}
-	for _, r := range shown {
-		b.WriteString(r.text)
-		b.WriteByte('\n')
+	if overBar != nil {
+		overBar.SetTotal(int64(max(len(over), 1)), false)
+		overBar.SetCurrent(int64(overStats.done + overStats.failed))
+		if final && !u.overFinal {
+			u.overFinal = true
+			overBar.SetTotal(int64(max(len(over), 1)), true)
+		}
 	}
-	if overflow != "" {
-		b.WriteString(overflow)
-		b.WriteByte('\n')
-	}
-	head := u.sHead.Render("goria") + u.sDim.Render(fmt.Sprintf("  活动 %d · 完成 %d/%d · 总速度 ", active, finished, len(tasks))) +
-		u.sSpeed.UnsetWidth().Render(humanBytes(totalSpeed)+"/s")
-	if sumTotal > 0 {
-		head += u.sDim.Render(fmt.Sprintf(" · 总进度 %.1f%% (%s/%s)",
-			float64(sumDone)/float64(sumTotal)*100, humanBytes(float64(sumDone)), humanBytes(float64(sumTotal))))
-	}
-	return head + "\n" + b.String()
 }
 
-func (u *UI) line(t *Task, st TaskState) string {
-	total, cur := t.total.Load(), t.done.Load()
-	kind := u.sKind.Render(t.Kind)
-	name := u.sName.Render(" " + trunc(t.Name, 24))
-	switch st {
-	case StateDone:
-		return kind + name + u.sOK.Render("✔ 完成 ") + u.sDim.Render(humanBytes(float64(cur)))
-	case StateFailed:
-		e, _ := t.err.Load().(string)
-		return kind + name + u.sErr.Render("✘ 失败 ") + u.sDim.Render(trunc(e, 50))
-	case StateWaiting:
-		return kind + name + u.sDim.Render("等待中…")
+// finalizeTaskBar 把任务条定格为终态行 (完成显示满条, 失败保留已下部分)
+func finalizeTaskBar(t *Task, bar *mpb.Bar) {
+	if t.barFinal {
+		return
 	}
-	const w = 30
-	pct := 0.0
-	if total > 0 {
-		pct = float64(cur) / float64(total)
+	t.barFinal = true
+	bar.SetCurrent(t.done.Load())
+	total := max(t.total.Load(), t.done.Load())
+	if total <= 0 {
+		total = 1
 	}
-	if pct > 1 {
-		pct = 1 // 已下超过总量 (服务器谎报大小等) 时钳制, 否则填充格数会溢出
-	}
-	fill := int(pct * w)
-	bar := u.sBarOn.Render(strings.Repeat("█", fill)) + u.sBarOff.Render(strings.Repeat("░", w-fill))
-	eta := "--:--"
-	if t.frames >= 5 && t.speed > 1 && total > 0 { // 热身约 0.5s (活动帧率下 5 帧) 后才显示 ETA, 避免开局乱跳
-		eta = fmtDur(time.Duration(float64(total-cur)/t.speed) * time.Second)
-	}
-	size := humanBytes(float64(cur))
-	if total > 0 {
-		size += "/" + humanBytes(float64(total))
-	}
-	info := fmt.Sprintf(" %s  ETA %s", size, eta)
-	if c := t.conns.Load(); c > 0 {
-		info += fmt.Sprintf("  连接 %d", c)
-	}
-	if ex, _ := t.Extra.Load().(string); ex != "" {
-		info += "  " + ex
-	}
-	return kind + name + bar + u.sPct.Render(fmt.Sprintf("%.1f%%", pct*100)) +
-		u.sSpeed.Render(humanBytes(t.speed)+"/s") + u.sDim.Render(info)
+	bar.SetTotal(total, true)
 }
 
 func humanBytes(b float64) string {
@@ -433,7 +558,7 @@ func fmtDur(d time.Duration) string {
 }
 
 // trunc 按显示宽度截断 (CJK 字符占 2 格), 超出时以 … 收尾且总宽不超过 n,
-// 与 lipgloss 的列宽口径一致, 中文文件名不会把进度行顶歪
+// 与 mpb 装饰器的列宽口径一致, 中文文件名不会把进度行顶歪
 func trunc(s string, n int) string {
 	if runewidth.StringWidth(s) <= n {
 		return s

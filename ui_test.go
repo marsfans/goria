@@ -1,15 +1,16 @@
 package main
 
-// UI 单元测试: 统一计数包装、实测 dt 下的速度/ETA 热身、多文件进度隔离、
-// 高度封顶与溢出行、终态帧稳定性
+// UI 单元测试: 统一计数包装、速度采样与 ETA 热身、多文件进度隔离、
+// 聚合统计、百分比钳制、CJK 宽度截断、mpb 条的高度封顶溢出分配
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/mattn/go-runewidth"
+	"github.com/vbauerster/mpb/v8"
 )
 
 type memWriterAt struct{ buf []byte }
@@ -49,69 +50,40 @@ func TestSpeedWarmupAndResetFile(t *testing.T) {
 	task.SetTotal(10 * 1024 * 1024)
 	task.SetState(StateActive)
 
-	// 第 1 帧有进度但 ETA 还在热身期
 	task.Add(1024 * 1024)
-	f1 := ui.buildFrame([]*Task{task}, 0.2)
-	if !strings.Contains(f1, "ETA --:--") {
-		t.Fatalf("热身期 ETA 应为 --:--, 帧: %q", f1)
+	task.sampleSpeed(0.2)
+	if got := task.etaText(); got != "--:--" {
+		t.Fatalf("热身期 ETA 应为 --:--, 实际 %s", got)
 	}
-	// 累计 6 帧后 ETA 出现, 百分比推进
 	for i := 0; i < 5; i++ {
 		task.Add(1024 * 1024)
-		f1 = ui.buildFrame([]*Task{task}, 0.2)
+		task.sampleSpeed(0.2)
 	}
-	if strings.Contains(f1, "ETA --:--") {
-		t.Fatalf("热身后应显示 ETA, 帧: %q", f1)
+	if got := task.etaText(); got == "--:--" {
+		t.Fatal("热身后应显示 ETA")
 	}
-	if !strings.Contains(f1, "60.0%") {
-		t.Fatalf("进度应为 60%%, 帧: %q", f1)
+	if got := task.pctOrStateText(); got != "60.0%" {
+		t.Fatalf("进度应为 60.0%%, 实际 %s", got)
+	}
+	if task.speedNow() <= 0 {
+		t.Fatal("EWMA 速度应为正")
 	}
 
-	// 切换到新文件: 进度清零, 速度采样重置 (下一帧速度归零、ETA 回热身)
+	// 切换到新文件: 进度清零, 采样重置 (速度归零、ETA 回热身)
 	task.ResetFile("next.iso")
 	if task.done.Load() != 0 || task.total.Load() != 0 {
 		t.Fatal("ResetFile 应清零进度")
 	}
-	f2 := ui.buildFrame([]*Task{task}, 0.2)
-	if !strings.Contains(f2, "next.iso") || !strings.Contains(f2, "0.0%") {
-		t.Fatalf("重置后帧错误: %q", f2)
+	task.sampleSpeed(0.2)
+	if got := task.etaText(); got != "--:--" {
+		t.Fatalf("重置后 ETA 应回到热身态, 实际 %s", got)
 	}
-	if !strings.Contains(f2, "ETA --:--") {
-		t.Fatalf("重置后 ETA 应回到热身态, 帧: %q", f2)
-	}
-}
-
-func TestBuildFrameHeightCap(t *testing.T) {
-	ui := NewUI(true)
-	ui.height = 6 // 顶栏 1 + 任务区最多 4 行 (含溢出行)
-	var tasks []*Task
-	for i := 0; i < 10; i++ {
-		tk := ui.NewTask(string(rune('a'+i))+".bin", "HTTP")
-		tk.SetTotal(100)
-		switch {
-		case i < 2:
-			tk.SetState(StateActive)
-		case i < 5:
-			tk.SetState(StateWaiting)
-		default:
-			tk.SetState(StateDone)
-		}
-		tasks = append(tasks, tk)
-	}
-	frame := ui.buildFrame(tasks, 0.2)
-	lines := strings.Count(strings.TrimRight(frame, "\n"), "\n") + 1
-	if lines > ui.height-1 {
-		t.Fatalf("帧行数 %d 超过封顶 %d", lines, ui.height-1)
-	}
-	if !strings.Contains(frame, "另有") {
-		t.Fatalf("应有溢出行, 帧: %q", frame)
-	}
-	if !strings.Contains(frame, "a.bin") {
-		t.Fatalf("活动任务应优先显示, 帧: %q", frame)
+	if got := task.pctOrStateText(); got != "--" {
+		t.Fatalf("重置后总量未知应显示 --, 实际 %s", got)
 	}
 }
 
-func TestGlobalProgressHeader(t *testing.T) {
+func TestAggregateStats(t *testing.T) {
 	ui := NewUI(true)
 	a := ui.NewTask("a", "HTTP")
 	a.SetTotal(100)
@@ -121,24 +93,25 @@ func TestGlobalProgressHeader(t *testing.T) {
 	b.SetTotal(300)
 	b.Add(150)
 	b.SetState(StateActive)
-	unknown := ui.NewTask("c", "HTTP") // total 未知不计入总进度
-	unknown.SetState(StateActive)
-	frame := ui.buildFrame([]*Task{a, b, unknown}, 0.2)
-	if !strings.Contains(frame, "总进度 50.0%") {
-		t.Fatalf("顶栏应有总进度 50.0%% (200/400), 帧: %q", frame)
+	c := ui.NewTask("c", "HTTP") // 总量未知: 不计入 sumTotal
+	c.SetState(StateWaiting)
+	s := aggregateStats([]*Task{a, b, c})
+	if s.done != 1 || s.active != 1 || s.waiting != 1 {
+		t.Fatalf("状态计数错误: %+v", s)
+	}
+	if s.sumDone != 200 || s.sumTotal != 400 {
+		t.Fatalf("总进度聚合错误: %d/%d, 期望 200/400", s.sumDone, s.sumTotal)
 	}
 }
 
-func TestRenderIntervalAdaptive(t *testing.T) {
+func TestPctClamp(t *testing.T) {
 	ui := NewUI(true)
-	tk := ui.NewTask("x", "HTTP")
-	tk.SetState(StateDone)
-	if got := ui.renderInterval(); got != 500*time.Millisecond {
-		t.Fatalf("无活动任务应 500ms, 实际 %v", got)
-	}
-	tk.SetState(StateActive)
-	if got := ui.renderInterval(); got != 100*time.Millisecond {
-		t.Fatalf("有活动任务应 100ms, 实际 %v", got)
+	task := ui.NewTask("over.bin", "HTTP")
+	task.SetTotal(100)
+	task.Add(150) // 已下超过总量 (服务器谎报大小)
+	task.SetState(StateActive)
+	if got := task.pctOrStateText(); got != "100.0%" {
+		t.Fatalf("百分比应钳制为 100.0%%, 实际 %s", got)
 	}
 }
 
@@ -156,30 +129,30 @@ func TestTruncDisplayWidth(t *testing.T) {
 	}
 }
 
-func TestLinePctClamp(t *testing.T) {
-	ui := NewUI(true)
-	task := ui.NewTask("over.bin", "HTTP")
-	task.SetTotal(100)
-	task.Add(150) // 已下超过总量 (服务器谎报大小)
-	task.SetState(StateActive)
-	for i := 0; i < 6; i++ { // 过热身期
-		ui.buildFrame([]*Task{task}, 0.2)
-	}
-	frame := ui.buildFrame([]*Task{task}, 0.2) // 不应 panic 且钳制在 100%
-	if !strings.Contains(frame, "100.0%") {
-		t.Fatalf("百分比应钳制为 100.0%%, 帧: %q", frame)
-	}
-}
+func TestAttachOverflowCap(t *testing.T) {
+	u := NewUI(true)
+	u.height = 6 // 任务条上限 = 6-3 = 3
+	u.p = mpb.New(mpb.WithOutput(io.Discard))
+	u.bars = map[*Task]*mpb.Bar{}
+	u.makeSumBarLocked()
+	defer u.p.Shutdown()
 
-func TestDoneFrameStable(t *testing.T) {
-	ui := NewUI(true)
-	task := ui.NewTask("done.bin", "HTTP")
-	task.SetTotal(100)
-	task.Add(100)
-	task.SetState(StateDone)
-	f1 := ui.buildFrame([]*Task{task}, 0.2)
-	f2 := ui.buildFrame([]*Task{task}, 0.2)
-	if f1 != f2 {
-		t.Fatalf("终态帧应逐字稳定 (静止不重绘的前提):\n%q\n%q", f1, f2)
+	var tasks []*Task
+	for i := 0; i < 10; i++ {
+		tasks = append(tasks, u.NewTask(string(rune('a'+i))+".bin", "HTTP"))
+	}
+	if len(u.bars) != 3 {
+		t.Fatalf("任务条应封顶为 3, 实际 %d", len(u.bars))
+	}
+	if len(u.overTasks) != 7 || u.overBar == nil {
+		t.Fatalf("其余 7 个任务应进溢出组: over=%d overBar=%v", len(u.overTasks), u.overBar != nil)
+	}
+	// 收尾定格不应 panic, 且任务条进入完成态
+	tasks[0].SetTotal(10)
+	tasks[0].Add(10)
+	tasks[0].SetState(StateDone)
+	u.syncOnce(0.1, true)
+	if !u.bars[tasks[0]].AbortedOrCompleted() {
+		t.Fatal("定格后任务条应为完成态")
 	}
 }

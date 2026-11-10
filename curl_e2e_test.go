@@ -347,39 +347,43 @@ func TestVerboseAndSilent(t *testing.T) {
 
 	// -v: 下载后 UI 日志里应有请求行
 	ui := NewUI(true)
+	var logBuf bytes.Buffer
+	ui.logOut = &logBuf
 	opt := &Options{Dir: t.TempDir(), Verbose: true, Headers: []string{"Authorization: Bearer sekret"}}
 	if err := DownloadHTTP(context.Background(), srv.URL+"/file.bin", opt, dlTask(ui), ui); err != nil {
 		t.Fatal(err)
 	}
-	ui.mu.Lock()
-	logs := strings.Join(ui.logs, "\n")
-	ui.mu.Unlock()
+	logs := logBuf.String()
 	if !strings.Contains(logs, "GET") || !strings.Contains(logs, "206") {
 		t.Fatalf("-v 应输出请求/响应行, 实际日志: %q", logs)
 	}
 	// verboseHeaders 脱敏
 	ui2 := NewUI(true)
+	var logBuf2 bytes.Buffer
+	ui2.logOut = &logBuf2
 	h := http.Header{"Authorization": []string{"Bearer sekret"}, "X-Ok": []string{"1"}}
 	verboseHeaders(ui2, &Options{Verbose: true}, ">", h)
-	joined := strings.Join(ui2.logs, "\n")
+	joined := logBuf2.String()
 	if strings.Contains(joined, "sekret") || !strings.Contains(joined, "***") || !strings.Contains(joined, "X-Ok") {
 		t.Fatalf("-v 脱敏错误: %q", joined)
 	}
 
 	// -s: 普通日志被丢弃; 错误日志默认也丢, 开 -S 后保留
 	ui3 := NewUI(true)
+	var logBuf3 bytes.Buffer
+	ui3.logOut = &logBuf3
 	ui3.silent = true
 	ui3.Info("info")
 	ui3.Success("ok")
 	ui3.Warn("warn")
 	ui3.Error("err-hidden")
-	if len(ui3.logs) != 0 {
-		t.Fatalf("-s 应丢弃全部普通日志, 实际 %q", ui3.logs)
+	if logBuf3.Len() != 0 {
+		t.Fatalf("-s 应丢弃全部普通日志, 实际 %q", logBuf3.String())
 	}
 	ui3.showError = true
 	ui3.Error("err-shown")
-	if len(ui3.logs) != 1 || !strings.Contains(ui3.logs[0], "err-shown") {
-		t.Fatalf("-s -S 应保留错误日志, 实际 %q", ui3.logs)
+	if !strings.Contains(logBuf3.String(), "err-shown") {
+		t.Fatalf("-s -S 应保留错误日志, 实际 %q", logBuf3.String())
 	}
 }
 
