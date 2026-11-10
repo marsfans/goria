@@ -262,7 +262,7 @@ func DownloadMetalink(ctx context.Context, src string, opt *Options, task *Task,
 		} else {
 			fo.mirrors = nil
 		}
-		task.Name = fo.Out
+		task.ResetFile(fo.Out) // 多文件逐个独立计进度, 不跨文件累加
 		if err := DownloadHTTP(ctx, f.Mirrors[0], &fo, task, ui); err != nil {
 			return fmt.Errorf("%s: %w", f.Name, err)
 		}

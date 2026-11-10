@@ -521,6 +521,7 @@ func fetchSegment(ctx context.Context, c *http.Client, u string, opt *Options, f
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("HTTP %s", resp.Status)
 	}
+	w := task.CountingWriterAt(fh) // 写入自动计入进度
 	buf := make([]byte, 64*1024)
 	for {
 		if opt.limiter != nil {
@@ -530,14 +531,13 @@ func fetchSegment(ctx context.Context, c *http.Client, u string, opt *Options, f
 		}
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
-			if _, err := fh.WriteAt(buf[:n], off-opt.rangeBase); err != nil {
+			if _, err := w.WriteAt(buf[:n], off-opt.rangeBase); err != nil {
 				return err
 			}
 			off += int64(n)
 			mu.Lock()
 			s.Done += int64(n)
 			mu.Unlock()
-			task.Add(int64(n))
 		}
 		if rerr == io.EOF {
 			if s.End >= 0 && off <= s.End {

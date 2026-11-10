@@ -28,6 +28,7 @@ func pumpSegment(ctx context.Context, r io.Reader, fh *os.File, opt *Options, s 
 	if s.End >= 0 {
 		want = s.End - off + 1
 	}
+	w := task.CountingWriterAt(fh) // 写入自动计入进度
 	buf := make([]byte, 64*1024)
 	var got int64
 	for want < 0 || got < want {
@@ -43,7 +44,7 @@ func pumpSegment(ctx context.Context, r io.Reader, fh *os.File, opt *Options, s 
 			if want >= 0 && int64(n) > want-got {
 				n = int(want - got)
 			}
-			if _, err := fh.WriteAt(buf[:n], off); err != nil {
+			if _, err := w.WriteAt(buf[:n], off); err != nil {
 				return err
 			}
 			off += int64(n)
@@ -51,7 +52,6 @@ func pumpSegment(ctx context.Context, r io.Reader, fh *os.File, opt *Options, s 
 			mu.Lock()
 			s.Done += int64(n)
 			mu.Unlock()
-			task.Add(int64(n))
 		}
 		if rerr == io.EOF {
 			if want >= 0 && got < want {
