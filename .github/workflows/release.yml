@@ -10,6 +10,9 @@ on:
         description: "更新内容（留空则自动使用上个版本以来的提交说明）"
         required: false
         default: ""
+  push:
+    tags:
+      - "v*" # 推送 v* tag 自动发布, 版本号取 tag 名, 更新内容自动生成
 
 permissions:
   contents: write
@@ -36,7 +39,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           ext=""; [ "$GOOS" = windows ] && ext=".exe"
           out="goria-${VERSION}-${GOOS}-${GOARCH}${ext}"
@@ -75,8 +78,8 @@ jobs:
           cat notes.md
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version }}
-          name: ${{ inputs.version }}
+          tag_name: ${{ inputs.version || github.ref_name }}
+          name: ${{ inputs.version || github.ref_name }}
           body_path: notes.md
           target_commitish: ${{ github.sha }}
           files: |

@@ -139,10 +139,14 @@ func applyCurlAliases(opt *Options) {
 
 var cfgFile string
 
+// version 由 release 工作流经 -ldflags "-X main.version=vX.Y.Z" 注入
+var version = "dev"
+
 func main() {
 	root := &cobra.Command{
-		Use:   "goria [flags] URL|MAGNET|TORRENT ...",
-		Short: "类 aria2 的多协议下载工具 (HTTP/HTTPS/BitTorrent/Magnet)",
+		Use:     "goria [flags] URL|MAGNET|TORRENT ...",
+		Short:   "类 aria2 的多协议下载工具 (HTTP/HTTPS/BitTorrent/Magnet)",
+		Version: version,
 		Example: `  goria -x 16 https://example.com/big.iso
   goria -d ./dl -j 3 -i urls.txt
   goria --max-speed 2M -o a.zip https://example.com/a.zip
