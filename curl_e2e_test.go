@@ -383,6 +383,48 @@ func TestVerboseAndSilent(t *testing.T) {
 	}
 }
 
+// TestHTTP2Negotiated: goria 的客户端 (克隆 DefaultTransport, 自带 ForceAttemptHTTP2)
+// 即使设置了自定义 DialContext 与 TLS 配置, 对支持 h2 的 HTTPS 服务器也应协商出 HTTP/2
+func TestHTTP2Negotiated(t *testing.T) {
+	var serverProto atomic.Value
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverProto.Store(r.Proto)
+		w.Write([]byte("h2-body"))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	// Insecure 会让 newHTTPClient 设置自定义 TLSClientConfig —— 正是容易弄丢 h2 的组合
+	c, err := newHTTPClient(&Options{Insecure: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.Proto != "HTTP/2.0" {
+		t.Fatalf("客户端应协商 HTTP/2, 实际 %s", resp.Proto)
+	}
+	if p, _ := serverProto.Load().(string); p != "HTTP/2.0" {
+		t.Fatalf("服务端应看到 HTTP/2, 实际 %s", p)
+	}
+	// 完整下载路径同样可用
+	dir := t.TempDir()
+	opt := &Options{Dir: dir, Insecure: true, Out: "h2.txt"}
+	// 该测试服务器不支持 Range, 走单分片; 文件名由 -o 指定
+	srv2 := httptest.NewTLSServer(serveContentHandler([]byte("h2-content"), time.Now()))
+	defer srv2.Close()
+	if err := DownloadHTTP(context.Background(), srv2.URL+"/h2.txt", opt, dlTask(NewUI(true)), NewUI(true)); err != nil {
+		t.Fatalf("h2 服务器下载失败: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "h2.txt")); string(b) != "h2-content" {
+		t.Fatalf("内容错误: %q", b)
+	}
+}
+
 // TestCreateDirs: -o 含多级子路径时 --create-dirs 自动建目录并落盘
 func TestCreateDirs(t *testing.T) {
 	content := []byte("nested")
