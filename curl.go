@@ -69,6 +69,31 @@ func validateOptions(opt *Options) error {
 	if opt.ConnectTimeout < 0 || opt.MaxTime < 0 || opt.RetryDelay < 0 {
 		return fmt.Errorf("--connect-timeout/--max-time/--retry-delay 不能为负")
 	}
+	if opt.HTTP11 && (opt.HTTP2 || opt.HTTP3 || opt.HTTP3Only) {
+		return fmt.Errorf("--http1.1 不能与 --http2/--http3/--http3-only 同时使用")
+	}
+	if opt.HTTP3Only && opt.Proxy != "" {
+		return fmt.Errorf("--http3-only 不能与代理同用 (QUIC 不走 HTTP 代理)")
+	}
+	return nil
+}
+
+var errProtoMismatch = errors.New("协商出的协议不符合 --http2/--http3-only 要求")
+
+// checkProto 校验响应实际协商出的协议是否满足 --http2 / --http3-only 的要求
+func checkProto(resp *http.Response, opt *Options) error {
+	if opt.HTTP3Only {
+		if resp.ProtoMajor != 3 {
+			return fmt.Errorf("%w: 实际 %s", errProtoMismatch, resp.Proto)
+		}
+		return nil
+	}
+	if opt.HTTP2 {
+		if resp.ProtoMajor == 2 || (opt.HTTP3 && resp.ProtoMajor == 3) {
+			return nil
+		}
+		return fmt.Errorf("%w: 实际 %s", errProtoMismatch, resp.Proto)
+	}
 	return nil
 }
 
@@ -455,6 +480,9 @@ func doHead(ctx context.Context, c *http.Client, u string, opt *Options, task *T
 		return err
 	}
 	defer resp.Body.Close()
+	if err := checkProto(resp, opt); err != nil {
+		return err
+	}
 	io.Copy(io.Discard, resp.Body)
 	verboseLog(ui, opt, "< %s", resp.Status)
 	verboseHeaders(ui, opt, "<", resp.Header)
@@ -555,6 +583,9 @@ func doCustomRequest(ctx context.Context, c *http.Client, u string, opt *Options
 		return err
 	}
 	defer resp.Body.Close()
+	if err := checkProto(resp, opt); err != nil {
+		return err
+	}
 	verboseLog(ui, opt, "< %s", resp.Status)
 	verboseHeaders(ui, opt, "<", resp.Header)
 	writeDumpHeader(opt, resp, ui)

@@ -55,6 +55,10 @@ type Options struct {
 	Compressed     bool     `mapstructure:"compressed"`
 	IPv4           bool     `mapstructure:"ipv4"`
 	IPv6           bool     `mapstructure:"ipv6"`
+	HTTP11         bool     `mapstructure:"http11"` // 配置键 http11; 命令行 --http1.1 在 RunE 里手动并入 (viper 键含点号会误作嵌套)
+	HTTP2          bool     `mapstructure:"http2"`
+	HTTP3          bool     `mapstructure:"http3"`
+	HTTP3Only      bool     `mapstructure:"http3-only"`
 	ConnectTimeout float64  `mapstructure:"connect-timeout"` // 秒
 	MaxTime        float64  `mapstructure:"max-time"`        // 秒, 单任务总超时
 	RetryDelay     float64  `mapstructure:"retry-delay"`     // 秒, 0 = 指数退避
@@ -93,6 +97,17 @@ func (o *Options) retryDelay(try int) time.Duration {
 		return time.Duration(o.RetryDelay * float64(time.Second))
 	}
 	return time.Duration(try+1) * time.Second
+}
+
+// mergeHTTP11Flag 并入 --http1.1: 该键名含点号, viper 会把点号当嵌套分隔符,
+// 故不走 Unmarshal, 直接从命令行 flag 读 (配置文件请用 http11 键)
+func mergeHTTP11Flag(opt *Options, cmd *cobra.Command) {
+	if cmd.Flags().Lookup("http1.1") == nil {
+		return // 子命令没有这个 flag (如 resume), 仅配置文件 http11 键生效
+	}
+	if v, err := cmd.Flags().GetBool("http1.1"); err == nil && v {
+		opt.HTTP11 = true
+	}
 }
 
 // applyCurlAliases 把 curl 别名参数的值并入主参数 (别名以独立 viper 键注册,
@@ -144,6 +159,7 @@ func main() {
 				opt.Out = "" // -o 不从配置文件继承
 			}
 			applyCurlAliases(opt)
+			mergeHTTP11Flag(opt, cmd)
 			return run(opt, args)
 		},
 	}
@@ -179,6 +195,10 @@ func main() {
 	f.Bool("compressed", false, "请求压缩传输并自动解压 (单连接路径)")
 	f.BoolP("ipv4", "4", false, "仅使用 IPv4")
 	f.BoolP("ipv6", "6", false, "仅使用 IPv6")
+	f.Bool("http1.1", false, "强制 HTTP/1.1 (禁用 HTTP/2 协商; 配置文件键为 http11)")
+	f.Bool("http2", false, "要求 HTTPS 协商出 HTTP/2, 否则失败 (明文 http 不适用)")
+	f.Bool("http3", false, "先尝试 HTTP/3 (QUIC), 失败回落到 TCP 传输 (仅 HTTPS)")
+	f.Bool("http3-only", false, "只用 HTTP/3, 不回落 (仅 HTTPS, 不能与代理同用)")
 	f.Float64("connect-timeout", 0, "连接超时 (秒, 支持小数)")
 	f.Float64("max-time", 0, "单任务总超时 (秒, 支持小数; curl 的 -m, 本工具短名已被重试次数占用)")
 	f.Float64("retry-delay", 0, "重试间隔 (秒, 0 = 指数退避)")
@@ -246,6 +266,7 @@ func main() {
 				opt.Out = "" // -o 不从配置文件继承
 			}
 			applyCurlAliases(opt)
+			mergeHTTP11Flag(opt, cmd)
 			path := opt.SaveSession
 			if path == "" {
 				path = defaultSessionPath()

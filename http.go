@@ -64,8 +64,8 @@ func newHTTPClient(opt *Options) (*http.Client, error) {
 		return dialer.DialContext(ctx, network, addr)
 	}
 
+	// 总是显式持有 tlsCfg: 协议选择 (ALPN/NextProtos) 也要经它表达
 	tlsCfg := &tls.Config{InsecureSkipVerify: opt.Insecure}
-	needTLS := opt.Insecure
 	if opt.CACert != "" {
 		pem, err := os.ReadFile(opt.CACert)
 		if err != nil {
@@ -79,7 +79,6 @@ func newHTTPClient(opt *Options) (*http.Client, error) {
 			return nil, fmt.Errorf("--cacert: %q 中没有可用的 PEM 证书", opt.CACert)
 		}
 		tlsCfg.RootCAs = pool
-		needTLS = true
 	}
 	if opt.Cert != "" && opt.Key != "" {
 		cert, err := tls.LoadX509KeyPair(opt.Cert, opt.Key)
@@ -87,11 +86,14 @@ func newHTTPClient(opt *Options) (*http.Client, error) {
 			return nil, fmt.Errorf("--cert/--key: %w", err)
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
-		needTLS = true
 	}
-	if needTLS {
-		tr.TLSClientConfig = tlsCfg
+	if opt.HTTP11 {
+		// 强制 HTTP/1.1: ALPN 只报 http/1.1, 且关掉传输层的 h2 自动配置
+		tlsCfg.NextProtos = []string{"http/1.1"}
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		tr.ForceAttemptHTTP2 = false
 	}
+	tr.TLSClientConfig = tlsCfg
 	if opt.Proxy != "" {
 		u, err := url.Parse(opt.Proxy)
 		if err != nil {
@@ -99,9 +101,23 @@ func newHTTPClient(opt *Options) (*http.Client, error) {
 		}
 		tr.Proxy = http.ProxyURL(u)
 	}
+	var rt http.RoundTripper = tr
+	if opt.HTTP3Only {
+		hrt, err := newH3Transport(opt, tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		rt = hrt
+	} else if opt.HTTP3 {
+		hrt, err := newH3Transport(opt, tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		rt = &protoFallbackTransport{primary: hrt, fallback: tr}
+	}
 	jar, _ := cookiejar.New(nil)
 	return &http.Client{
-		Transport: tr,
+		Transport: rt,
 		Jar:       jar,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if opt.NoLocation {
@@ -174,6 +190,10 @@ func probe(ctx context.Context, c *http.Client, u string, opt *Options) (size in
 		return
 	}
 	defer resp.Body.Close()
+	if perr := checkProto(resp, opt); perr != nil {
+		err = perr
+		return
+	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
 	hdr, status = resp.Header, resp.Status
 	if resp.StatusCode == http.StatusNotModified {
@@ -214,6 +234,14 @@ func probe(ctx context.Context, c *http.Client, u string, opt *Options) (size in
 func DownloadHTTP(ctx context.Context, u string, opt *Options, task *Task, ui *UI) error {
 	o := *opt // 每任务一份副本: --range 解析结果等任务内状态不与其他并发任务共享
 	opt = &o
+	if strings.HasPrefix(u, "http://") {
+		if opt.HTTP3 || opt.HTTP3Only {
+			return fmt.Errorf("HTTP/3 仅适用于 HTTPS")
+		}
+		if opt.HTTP2 {
+			return fmt.Errorf("--http2 仅适用于 HTTPS (明文 h2c 不支持)")
+		}
+	}
 	c, err := newHTTPClient(opt)
 	if err != nil {
 		return err
@@ -232,7 +260,7 @@ func DownloadHTTP(ctx context.Context, u string, opt *Options, task *Task, ui *U
 	var hdr http.Header
 	var status string
 	for try := 0; try <= opt.Retries; try++ { // 探测失败 (如 429/5xx) 时重试
-		if size, ranges, name, etag, hdr, status, err = probe(ctx, c, u, opt); err == nil || err == errNotModified || ctx.Err() != nil {
+		if size, ranges, name, etag, hdr, status, err = probe(ctx, c, u, opt); err == nil || err == errNotModified || errors.Is(err, errProtoMismatch) || ctx.Err() != nil {
 			break
 		}
 		select {

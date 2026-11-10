@@ -19,6 +19,10 @@ user-agent: goria/1.0
 # retry-delay: 2
 # data:
 #   - "a=1"
+# http11: false        # 强制 HTTP/1.1 (命令行 --http1.1)
+# http2: false         # 要求协商出 HTTP/2
+# http3: false         # 先试 HTTP/3 再回落
+# http3-only: false
 seed-ratio: 0                  # BT 做种分享率
 listen-port: 0
 # save-session: ~/.config/goria/session.json   # 会话文件: 保存未完成任务, 用 goria resume 恢复 (空 关闭)

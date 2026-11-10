@@ -38,6 +38,13 @@ goria -C 4096 https://example.com/big.iso             # 从已有文件的 4096 
 
 - `-X/--request` 方法; `--data` / `--data-binary` / `--data-raw` / `--data-urlencode` 发送数据 (`@文件` 语义与 curl 同, 多段以 `&` 连接, 有数据时默认 POST); `-F/--form` multipart (`name=value`、`name=@文件[;type=;filename=]`、`name=<文件`)
 - `-I/--head` 只取响应头; `-D/--dump-header` 响应头写文件 (`-` 为 stderr); `--include` 响应头写入输出文件开头; `-v/--verbose` 打印请求/响应 (Authorization/Cookie 脱敏); `-s/--silent` 静默, `-S/--show-error` 静默时仍显示错误
+
+协议选择 (仅 HTTPS; 明文 h2c 不支持):
+
+- 默认自动协商: HTTPS 经 ALPN 协商 HTTP/2, 失败回落 HTTP/1.1
+- `--http1.1` 强制 HTTP/1.1 (配置文件键为 `http11`; 与 `--http2/--http3` 冲突)
+- `--http2` 要求协商出 HTTP/2, 谈不出就报错不下载
+- `--http3` 先直连目标端口试 HTTP/3 (QUIC/UDP, 不做 Alt-Svc 发现), 传输失败回落 TCP 并锁定; `--http3-only` 只用 HTTP/3 不回落 (不能与代理同用)。TLS 参数 (`--cacert/--cert/--key/--insecure`) 对 QUIC 同样生效
 - 状态码按 curl 语义: 默认保存响应体 (如 404 页面), 加 `-f/--fail` 后 >=400 报错且不落盘; 传输错误按 `--max-tries` 重试 (每次重发完整请求体)
 
 ```
