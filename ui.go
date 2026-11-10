@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 	"github.com/muesli/termenv"
 	"github.com/pterm/pterm"
 	"golang.org/x/term"
@@ -209,18 +210,32 @@ func (u *UI) Start() {
 	}
 	go func() {
 		defer close(u.stopped)
-		tk := time.NewTicker(200 * time.Millisecond)
-		defer tk.Stop()
+		tm := time.NewTimer(100 * time.Millisecond)
+		defer tm.Stop()
 		for {
 			select {
-			case <-tk.C:
+			case <-tm.C:
 				u.render()
+				tm.Reset(u.renderInterval())
 			case <-u.stop:
 				u.render()
 				return
 			}
 		}
 	}()
+}
+
+// renderInterval 自适应帧率: 有活动任务时 100ms 跟手, 全静止时 500ms 省电省 IO
+// (速度按实测帧间隔计算, 变帧率不影响数值准确性)
+func (u *UI) renderInterval() time.Duration {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for _, t := range u.tasks {
+		if TaskState(t.state.Load()) == StateActive {
+			return 100 * time.Millisecond
+		}
+	}
+	return 500 * time.Millisecond
 }
 
 func (u *UI) Stop() {
@@ -279,9 +294,14 @@ func (u *UI) buildFrame(tasks []*Task, dt float64) string {
 	}
 	rows := make([]row, 0, len(tasks))
 	var totalSpeed float64
+	var sumDone, sumTotal int64
 	active, finished := 0, 0
 	for _, t := range tasks {
 		cur := t.done.Load()
+		if tot := t.total.Load(); tot > 0 {
+			sumTotal += tot
+			sumDone += min(cur, tot)
+		}
 		if ep := t.epoch.Load(); ep != t.seenEpoch {
 			t.seenEpoch = ep
 			t.lastBytes = cur
@@ -344,6 +364,10 @@ func (u *UI) buildFrame(tasks []*Task, dt float64) string {
 	}
 	head := u.sHead.Render("goria") + u.sDim.Render(fmt.Sprintf("  活动 %d · 完成 %d/%d · 总速度 ", active, finished, len(tasks))) +
 		u.sSpeed.UnsetWidth().Render(humanBytes(totalSpeed)+"/s")
+	if sumTotal > 0 {
+		head += u.sDim.Render(fmt.Sprintf(" · 总进度 %.1f%% (%s/%s)",
+			float64(sumDone)/float64(sumTotal)*100, humanBytes(float64(sumDone)), humanBytes(float64(sumTotal))))
+	}
 	return head + "\n" + b.String()
 }
 
@@ -365,10 +389,13 @@ func (u *UI) line(t *Task, st TaskState) string {
 	if total > 0 {
 		pct = float64(cur) / float64(total)
 	}
+	if pct > 1 {
+		pct = 1 // 已下超过总量 (服务器谎报大小等) 时钳制, 否则填充格数会溢出
+	}
 	fill := int(pct * w)
 	bar := u.sBarOn.Render(strings.Repeat("█", fill)) + u.sBarOff.Render(strings.Repeat("░", w-fill))
 	eta := "--:--"
-	if t.frames >= 5 && t.speed > 1 && total > 0 { // 热身约 1s 后才显示 ETA, 避免开局乱跳
+	if t.frames >= 5 && t.speed > 1 && total > 0 { // 热身约 0.5s (活动帧率下 5 帧) 后才显示 ETA, 避免开局乱跳
 		eta = fmtDur(time.Duration(float64(total-cur)/t.speed) * time.Second)
 	}
 	size := humanBytes(float64(cur))
@@ -405,10 +432,21 @@ func fmtDur(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
+// trunc 按显示宽度截断 (CJK 字符占 2 格), 超出时以 … 收尾且总宽不超过 n,
+// 与 lipgloss 的列宽口径一致, 中文文件名不会把进度行顶歪
 func trunc(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
+	if runewidth.StringWidth(s) <= n {
 		return s
 	}
-	return string(r[:n-1]) + "…"
+	var b strings.Builder
+	w := 0
+	for _, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if w+rw > n-1 {
+			break
+		}
+		b.WriteRune(r)
+		w += rw
+	}
+	return b.String() + "…"
 }

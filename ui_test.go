@@ -7,6 +7,9 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/mattn/go-runewidth"
 )
 
 type memWriterAt struct{ buf []byte }
@@ -105,6 +108,66 @@ func TestBuildFrameHeightCap(t *testing.T) {
 	}
 	if !strings.Contains(frame, "a.bin") {
 		t.Fatalf("活动任务应优先显示, 帧: %q", frame)
+	}
+}
+
+func TestGlobalProgressHeader(t *testing.T) {
+	ui := NewUI(true)
+	a := ui.NewTask("a", "HTTP")
+	a.SetTotal(100)
+	a.Add(50)
+	a.SetState(StateDone)
+	b := ui.NewTask("b", "HTTP")
+	b.SetTotal(300)
+	b.Add(150)
+	b.SetState(StateActive)
+	unknown := ui.NewTask("c", "HTTP") // total 未知不计入总进度
+	unknown.SetState(StateActive)
+	frame := ui.buildFrame([]*Task{a, b, unknown}, 0.2)
+	if !strings.Contains(frame, "总进度 50.0%") {
+		t.Fatalf("顶栏应有总进度 50.0%% (200/400), 帧: %q", frame)
+	}
+}
+
+func TestRenderIntervalAdaptive(t *testing.T) {
+	ui := NewUI(true)
+	tk := ui.NewTask("x", "HTTP")
+	tk.SetState(StateDone)
+	if got := ui.renderInterval(); got != 500*time.Millisecond {
+		t.Fatalf("无活动任务应 500ms, 实际 %v", got)
+	}
+	tk.SetState(StateActive)
+	if got := ui.renderInterval(); got != 100*time.Millisecond {
+		t.Fatalf("有活动任务应 100ms, 实际 %v", got)
+	}
+}
+
+func TestTruncDisplayWidth(t *testing.T) {
+	if got := trunc("中文文件名测试长长长", 10); runewidth.StringWidth(got) > 10 {
+		t.Fatalf("CJK 截断宽度超限: %q (宽 %d)", got, runewidth.StringWidth(got))
+	} else if !strings.HasSuffix(got, "…") {
+		t.Fatalf("截断应以 … 收尾: %q", got)
+	}
+	if got := trunc("short", 10); got != "short" {
+		t.Fatalf("短串不应动: %q", got)
+	}
+	if got := trunc("abcdefghijklmnop", 8); got != "abcdefg…" {
+		t.Fatalf("ASCII 截断错误: %q", got)
+	}
+}
+
+func TestLinePctClamp(t *testing.T) {
+	ui := NewUI(true)
+	task := ui.NewTask("over.bin", "HTTP")
+	task.SetTotal(100)
+	task.Add(150) // 已下超过总量 (服务器谎报大小)
+	task.SetState(StateActive)
+	for i := 0; i < 6; i++ { // 过热身期
+		ui.buildFrame([]*Task{task}, 0.2)
+	}
+	frame := ui.buildFrame([]*Task{task}, 0.2) // 不应 panic 且钳制在 100%
+	if !strings.Contains(frame, "100.0%") {
+		t.Fatalf("百分比应钳制为 100.0%%, 帧: %q", frame)
 	}
 }
 
